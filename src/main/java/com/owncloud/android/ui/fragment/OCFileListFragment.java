@@ -37,11 +37,14 @@ import android.support.annotation.Nullable;
 import android.support.annotation.StringRes;
 import android.support.design.widget.BottomNavigationView;
 import android.support.design.widget.Snackbar;
+import android.support.v4.app.FragmentActivity;
 import android.support.v4.widget.DrawerLayout;
 import android.support.v4.widget.SwipeRefreshLayout;
 import android.support.v7.app.ActionBar;
+import android.support.v7.widget.GridLayoutManager;
+import android.support.v7.widget.LinearLayoutManager;
+import android.support.v7.widget.RecyclerView;
 import android.text.TextUtils;
-import android.util.SparseBooleanArray;
 import android.view.ActionMode;
 import android.view.LayoutInflater;
 import android.view.Menu;
@@ -50,8 +53,6 @@ import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AbsListView;
-import android.widget.AdapterView;
-import android.widget.ListView;
 import android.widget.PopupMenu;
 import android.widget.RelativeLayout;
 import android.widget.TextView;
@@ -82,7 +83,7 @@ import com.owncloud.android.ui.activity.FolderPickerActivity;
 import com.owncloud.android.ui.activity.OnEnforceableRefreshListener;
 import com.owncloud.android.ui.activity.ToolbarActivity;
 import com.owncloud.android.ui.activity.UploadFilesActivity;
-import com.owncloud.android.ui.adapter.FileListListAdapter;
+import com.owncloud.android.ui.adapter.OCFileListAdapter;
 import com.owncloud.android.ui.dialog.ConfirmationDialogFragment;
 import com.owncloud.android.ui.dialog.CreateFolderDialogFragment;
 import com.owncloud.android.ui.dialog.RemoveFilesDialogFragment;
@@ -93,7 +94,6 @@ import com.owncloud.android.ui.events.DummyDrawerEvent;
 import com.owncloud.android.ui.events.EncryptionEvent;
 import com.owncloud.android.ui.events.FavoriteEvent;
 import com.owncloud.android.ui.events.SearchEvent;
-import com.owncloud.android.ui.helpers.SparseBooleanArrayParcelable;
 import com.owncloud.android.ui.interfaces.OCFileListFragmentInterface;
 import com.owncloud.android.ui.preview.PreviewImageFragment;
 import com.owncloud.android.ui.preview.PreviewMediaFragment;
@@ -115,11 +115,11 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.List;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * A Fragment that lists all files and folders in a given path.
- *
  * TODO refactor to get rid of direct dependency on FileDisplayActivity
  */
 public class OCFileListFragment extends ExtendedListFragment implements OCFileListFragmentInterface {
@@ -154,7 +154,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
     private FileFragment.ContainerActivity mContainerActivity;
 
     private OCFile mFile = null;
-    private FileListListAdapter mAdapter;
+    private OCFileListAdapter mAdapter;
     private boolean mJustFolders;
 
     private int mSystemBarActionModeColor;
@@ -173,6 +173,10 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
     private boolean searchFragment = false;
     private SearchEvent searchEvent;
     private AsyncTask remoteOperationAsyncTask;
+    private RecyclerView.OnScrollListener onScrollChangeListener;
+    private boolean photoSearchQueryRunning;
+    private boolean photoSearchNoNew = false;
+    private RemoteOperation remoteOperation;
 
     private enum MenuItemAddRemove {
         DO_NOTHING, REMOVE_SORT, REMOVE_GRID_AND_SORT, ADD_SORT, ADD_GRID_AND_SORT, ADD_GRID_AND_SORT_WITH_SEARCH,
@@ -200,6 +204,10 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         }
 
         searchFragment = currentSearchType != null;
+
+        if (isGridViewPreferred(getCurrentFile())) {
+            switchToGridView();
+        }
     }
 
     /**
@@ -268,6 +276,30 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         if (allowContextualActions) {
             setChoiceModeAsMultipleModal(savedInstanceState);
         }
+
+        onScrollChangeListener = new RecyclerView.OnScrollListener() {
+            @Override
+            public void onScrolled(RecyclerView recyclerView, int dx, int dy) {
+                if (recyclerView.getLayoutManager() instanceof GridLayoutManager) {
+                    GridLayoutManager gridLayoutManager = (GridLayoutManager) recyclerView.getLayoutManager();
+
+                    // scroll down
+                    if (dy > 0 && !photoSearchQueryRunning) {
+                        int visibleItemCount = gridLayoutManager.getChildCount();
+                        int totalItemCount = gridLayoutManager.getItemCount();
+                        int firstVisibleItem = gridLayoutManager.findFirstCompletelyVisibleItemPosition();
+
+                        if ((totalItemCount - visibleItemCount) <= (firstVisibleItem + 5)) {
+                            // Almost reached the end, continue to load new photos
+                            if ((totalItemCount - visibleItemCount) > 0) {
+                                searchAndDisplay();
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
         Log_OC.i(TAG, "onCreateView() end");
         return v;
     }
@@ -313,20 +345,16 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
             mFile = savedInstanceState.getParcelable(KEY_FILE);
         }
 
-        if (mJustFolders) {
-            setFooterEnabled(false);
-        } else {
-            setFooterEnabled(true);
-        }
-
         Bundle args = getArguments();
         mJustFolders = (args != null) && args.getBoolean(ARG_JUST_FOLDERS, false);
         boolean hideItemOptions = (args != null) && args.getBoolean(ARG_HIDE_ITEM_OPTIONS, false);
 
-        mAdapter = new FileListListAdapter(mJustFolders, getActivity(), mContainerActivity, this, hideItemOptions);
-        setListAdapter(mAdapter);
+        mAdapter = new OCFileListAdapter(mJustFolders, getActivity(), mContainerActivity, this, hideItemOptions,
+                isGridViewPreferred(mFile));
+        setRecyclerViewAdapter(mAdapter);
 
         mHideFab = (args != null) && args.getBoolean(ARG_HIDE_FAB, false);
+
         if (mHideFab) {
             setFabEnabled(false);
         } else {
@@ -349,7 +377,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         searchEvent = Parcels.unwrap(getArguments().getParcelable(OCFileListFragment.SEARCH_EVENT));
         prepareCurrentSearch(searchEvent);
         if (searchEvent != null && savedInstanceState == null) {
-            onMessageEvent(searchEvent);
+            onMessageEvent(searchEvent, true);
         }
 
         setTitle();
@@ -375,6 +403,8 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
                 currentSearchType = SearchType.RECENTLY_MODIFIED_SEARCH;
             } else if (event.getSearchType().equals(SearchOperation.SearchType.SHARED_SEARCH)) {
                 currentSearchType = SearchType.SHARED_FILTER;
+            } else if (event.getSearchType().equals(SearchOperation.SearchType.PHOTO_SEARCH)) {
+                currentSearchType = SearchType.PHOTO_SEARCH;
             }
 
             prepareActionBarItems(event);
@@ -517,34 +547,21 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
     }
 
     @Override
-    public void finishedFiltering() {
-        updateFooter();
-    }
-
-    @Override
     public void onShareIconClick(OCFile file) {
         mContainerActivity.getFileOperationsHelper().sendShareFile(file);
     }
 
     @Override
-    public void onOverflowIconClick(View view, OCFile file) {
+    public void onOverflowIconClicked(OCFile file, View view) {
         PopupMenu popup = new PopupMenu(getActivity(), view);
         popup.inflate(R.menu.file_actions_menu);
-        FileMenuFilter mf = new FileMenuFilter(
-                mAdapter.getFiles().size(),
-                Collections.singleton(file),
-                ((FileActivity) getActivity()).getAccount(),
-                mContainerActivity,
-                getActivity(),
-                true
-        );
+        FileMenuFilter mf = new FileMenuFilter(mAdapter.getFiles().size(), Collections.singleton(file),
+                ((FileActivity) getActivity()).getAccount(), mContainerActivity, getActivity(), true);
         mf.filter(popup.getMenu(), true);
-        popup.setOnMenuItemClickListener(new PopupMenu.OnMenuItemClickListener() {
-            @Override
-            public boolean onMenuItemClick(MenuItem item) {
-                ArrayList<OCFile> checkedFiles = new ArrayList<>(Collections.singletonList(file));
-                return onFileActionChosen(item.getItemId(), checkedFiles);
-            }
+        popup.setOnMenuItemClickListener(item -> {
+            Set<OCFile> checkedFiles = new HashSet<>();
+            checkedFiles.add(file);
+            return onFileActionChosen(item.getItemId(), checkedFiles);
         });
         popup.show();
     }
@@ -557,11 +574,9 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
      * Also listens to changes in navigation drawer to hide and recover multiple selection when it's opened
      * and closed.
      */
-    private class MultiChoiceModeListener
-            implements AbsListView.MultiChoiceModeListener, DrawerLayout.DrawerListener {
+    private class MultiChoiceModeListener implements AbsListView.MultiChoiceModeListener, DrawerLayout.DrawerListener {
 
         private static final String KEY_ACTION_MODE_CLOSED_BY_DRAWER = "KILLED_ACTION_MODE";
-        private static final String KEY_SELECTION_WHEN_CLOSED_BY_DRAWER = "CHECKED_ITEMS";
 
         /**
          * True when action mode is finished because the drawer was opened
@@ -571,7 +586,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         /**
          * Selected items in list when action mode is closed by drawer
          */
-        private SparseBooleanArray mSelectionWhenActionModeClosedByDrawer = null;
+        private HashSet<OCFile> mSelectionWhenActionModeClosedByDrawer = new HashSet<>();
 
         @Override
         public void onDrawerSlide(View drawerView, float slideOffset) {
@@ -591,17 +606,16 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
          */
         @Override
         public void onDrawerClosed(View drawerView) {
-            if (mSelectionWhenActionModeClosedByDrawer != null && mActionModeClosedByDrawer) {
-                for (int i = 0; i < mSelectionWhenActionModeClosedByDrawer.size(); i++) {
-                    if (mSelectionWhenActionModeClosedByDrawer.valueAt(i)) {
-                        getListView().setItemChecked(
-                                mSelectionWhenActionModeClosedByDrawer.keyAt(i),
-                                true
-                        );
-                    }
-                }
+            if (mActionModeClosedByDrawer && mSelectionWhenActionModeClosedByDrawer.size() > 0) {
+                FragmentActivity actionBarActivity = getActivity();
+                actionBarActivity.startActionMode(mMultiChoiceModeListener);
+
+                getAdapter().setCheckedItem(mSelectionWhenActionModeClosedByDrawer);
+
+                mActiveActionMode.invalidate();
+
+                mSelectionWhenActionModeClosedByDrawer.clear();
             }
-            mSelectionWhenActionModeClosedByDrawer = null;
         }
 
         /**
@@ -613,7 +627,8 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         @Override
         public void onDrawerStateChanged(int newState) {
             if (DrawerLayout.STATE_DRAGGING == newState && mActiveActionMode != null) {
-                mSelectionWhenActionModeClosedByDrawer = getListView().getCheckedItemPositions().clone();
+                mSelectionWhenActionModeClosedByDrawer.addAll(((OCFileListAdapter) getRecyclerView().getAdapter())
+                        .getCheckedItems());
                 mActiveActionMode.finish();
                 mActionModeClosedByDrawer = true;
             }
@@ -625,8 +640,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
          */
         @Override
         public void onItemCheckedStateChanged(ActionMode mode, int position, long id, boolean checked) {
-            getListView().invalidateViews();
-            mode.invalidate();
+            // nothing to do here
         }
 
         /**
@@ -647,6 +661,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
             // hide FAB in multi selection mode
             setFabEnabled(false);
 
+            mAdapter.setMultiSelect(true);
             return true;
         }
 
@@ -655,13 +670,9 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
          */
         @Override
         public boolean onPrepareActionMode(ActionMode mode, Menu menu) {
-            List<OCFile> checkedFiles = mAdapter.getCheckedItems(getListView());
-            final int checkedCount = checkedFiles.size();
-            String title = getResources().getQuantityString(
-                    R.plurals.items_selected_count,
-                    checkedCount,
-                    checkedCount
-            );
+            Set<OCFile> checkedFiles = mAdapter.getCheckedItems();
+            final int checkedCount = mAdapter.getCheckedItems().size();
+            String title = getResources().getQuantityString(R.plurals.items_selected_count, checkedCount, checkedCount);
             mode.setTitle(title);
             FileMenuFilter mf = new FileMenuFilter(
                     mAdapter.getFiles().size(),
@@ -680,7 +691,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
          */
         @Override
         public boolean onActionItemClicked(ActionMode mode, MenuItem item) {
-            ArrayList<OCFile> checkedFiles = mAdapter.getCheckedItems(getListView());
+            Set<OCFile> checkedFiles = mAdapter.getCheckedItems();
             return onFileActionChosen(item.getItemId(), checkedFiles);
         }
 
@@ -699,30 +710,19 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
             if (!mHideFab && !searchFragment) {
                 setFabEnabled(true);
             }
+
+            mAdapter.setMultiSelect(false);
+            mAdapter.clearCheckedItems();
         }
 
 
         public void storeStateIn(Bundle outState) {
             outState.putBoolean(KEY_ACTION_MODE_CLOSED_BY_DRAWER, mActionModeClosedByDrawer);
-            if (mSelectionWhenActionModeClosedByDrawer != null) {
-                SparseBooleanArrayParcelable sbap = new SparseBooleanArrayParcelable(
-                        mSelectionWhenActionModeClosedByDrawer
-                );
-                outState.putParcelable(KEY_SELECTION_WHEN_CLOSED_BY_DRAWER, sbap);
-            }
         }
 
         public void loadStateFrom(Bundle savedInstanceState) {
-            mActionModeClosedByDrawer = savedInstanceState.getBoolean(
-                    KEY_ACTION_MODE_CLOSED_BY_DRAWER,
-                    mActionModeClosedByDrawer
-            );
-            SparseBooleanArrayParcelable sbap = savedInstanceState.getParcelable(
-                    KEY_SELECTION_WHEN_CLOSED_BY_DRAWER
-            );
-            if (sbap != null) {
-                mSelectionWhenActionModeClosedByDrawer = sbap.getSparseBooleanArray();
-            }
+            mActionModeClosedByDrawer = savedInstanceState.getBoolean(KEY_ACTION_MODE_CLOSED_BY_DRAWER,
+                    mActionModeClosedByDrawer);
         }
     }
 
@@ -730,11 +730,9 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
      * Init listener that will handle interactions in multiple selection mode.
      */
     private void setChoiceModeAsMultipleModal(Bundle savedInstanceState) {
-        setChoiceMode(ListView.CHOICE_MODE_MULTIPLE_MODAL);
         if (savedInstanceState != null) {
             mMultiChoiceModeListener.loadStateFrom(savedInstanceState);
         }
-        setMultiChoiceModeListener(mMultiChoiceModeListener);
         ((FileActivity) getActivity()).addDrawerListener(mMultiChoiceModeListener);
     }
 
@@ -747,7 +745,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         }
 
         if (searchEvent != null) {
-            onMessageEvent(searchEvent);
+            onMessageEvent(searchEvent, true);
         }
     }
 
@@ -787,9 +785,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
                         menuItemOrig.getTitle());
             }
 
-        } else if (menuItemAddRemoveValue.equals(MenuItemAddRemove.ADD_GRID_AND_SORT))
-
-        {
+        } else if (menuItemAddRemoveValue.equals(MenuItemAddRemove.ADD_GRID_AND_SORT)) {
             if (menu.findItem(R.id.action_switch_view) == null) {
                 menuItemOrig = mOriginalMenuItems.get(0);
                 menu.add(menuItemOrig.getGroupId(), menuItemOrig.getItemId(), menuItemOrig.getOrder(),
@@ -878,107 +874,125 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         return moveCount;
     }
 
+
     @Override
-    public void onItemClick(AdapterView<?> l, View v, int position, long id) {
-        OCFile file = (OCFile) mAdapter.getItem(position);
+    public boolean onLongItemClicked(OCFile file) {
+        FragmentActivity actionBarActivity = getActivity();
+        getAdapter().addCheckedFile(file);
+        actionBarActivity.startActionMode(mMultiChoiceModeListener);
 
-        if (file != null) {
-            if (file.isFolder()) {
-                if (file.isEncrypted()) {
-                    // check if API >= 19
-                    if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.KITKAT) {
-                        Snackbar.make(mCurrentListView, R.string.end_to_end_encryption_not_supported,
-                                Snackbar.LENGTH_LONG).show();
-                        return;
-                    }
+        return true;
+    }
 
-                    // check if keys are stored
-                    ArbitraryDataProvider arbitraryDataProvider = new ArbitraryDataProvider(
-                            getContext().getContentResolver());
+    @Override
+    public void onItemClicked(OCFile file) {
+        if (getAdapter().isMultiSelect()) {
+            if (getAdapter().isCheckedFile(file)) {
+                getAdapter().removeCheckedFile(file);
+            } else {
+                getAdapter().addCheckedFile(file);
+            }
+            mActiveActionMode.invalidate();
+            mAdapter.notifyItemChanged(getAdapter().getItemPosition(file));
+        } else {
+            if (file != null) {
+                int position = mAdapter.getItemPosition(file);
+                
+                if (file.isFolder()) {
+                    if (file.isEncrypted()) {
+                        // check if API >= 19
+                        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.KITKAT) {
+                            Snackbar.make(getRecyclerView(), R.string.end_to_end_encryption_not_supported,
+                                    Snackbar.LENGTH_LONG).show();
+                            return;
+                        }
 
-                    Account account = ((FileActivity) mContainerActivity).getAccount();
-                    String publicKey = arbitraryDataProvider.getValue(account, EncryptionUtils.PUBLIC_KEY);
-                    String privateKey = arbitraryDataProvider.getValue(account, EncryptionUtils.PRIVATE_KEY);
+                        // check if keys are stored
+                        ArbitraryDataProvider arbitraryDataProvider = new ArbitraryDataProvider(
+                                getContext().getContentResolver());
 
-                    if (publicKey.isEmpty() || privateKey.isEmpty()) {
-                        Log_OC.d(TAG, "no public key for " + account.name);
+                        Account account = ((FileActivity) mContainerActivity).getAccount();
+                        String publicKey = arbitraryDataProvider.getValue(account, EncryptionUtils.PUBLIC_KEY);
+                        String privateKey = arbitraryDataProvider.getValue(account, EncryptionUtils.PRIVATE_KEY);
 
-                        SetupEncryptionDialogFragment dialog = SetupEncryptionDialogFragment.newInstance(account,
-                                position);
-                        dialog.setTargetFragment(this, SetupEncryptionDialogFragment.SETUP_ENCRYPTION_REQUEST_CODE);
-                        dialog.show(getFragmentManager(), SetupEncryptionDialogFragment.SETUP_ENCRYPTION_DIALOG_TAG);
+                        if (publicKey.isEmpty() || privateKey.isEmpty()) {
+                            Log_OC.d(TAG, "no public key for " + account.name);
+
+                            SetupEncryptionDialogFragment dialog = SetupEncryptionDialogFragment.newInstance(account,
+                                    position);
+                            dialog.setTargetFragment(this, SetupEncryptionDialogFragment.SETUP_ENCRYPTION_REQUEST_CODE);
+                            dialog.show(getFragmentManager(), SetupEncryptionDialogFragment.SETUP_ENCRYPTION_DIALOG_TAG);
+                        } else {
+                            // update state and view of this fragment
+                            searchFragment = false;
+
+                            if (mContainerActivity instanceof FolderPickerActivity &&
+                                    ((FolderPickerActivity) mContainerActivity)
+                                            .isDoNotEnterEncryptedFolder()) {
+                                Snackbar.make(getRecyclerView(), R.string.copy_move_to_encrypted_folder_not_supported,
+                                        Snackbar.LENGTH_LONG).show();
+                            } else {
+                                listDirectory(file, MainApp.isOnlyOnDevice(), false);
+                                // then, notify parent activity to let it update its state and view
+                                mContainerActivity.onBrowsedDownTo(file);
+                                // save index and top position
+                                saveIndexAndTopPosition(position);
+                            }
+                        }
                     } else {
                         // update state and view of this fragment
                         searchFragment = false;
+                        listDirectory(file, MainApp.isOnlyOnDevice(), false);
+                        // then, notify parent activity to let it update its state and view
+                        mContainerActivity.onBrowsedDownTo(file);
+                        // save index and top position
+                        saveIndexAndTopPosition(position);
+                    }
 
-                        if (mContainerActivity instanceof FolderPickerActivity &&
-                                ((FolderPickerActivity) mContainerActivity)
-                                        .isDoNotEnterEncryptedFolder()) {
-                            Snackbar.make(getListView(),
-                                    R.string.copy_move_to_encrypted_folder_not_supported,
-                                    Snackbar.LENGTH_LONG).show();
+                } else { /// Click on a file
+                    if (PreviewImageFragment.canBePreviewed(file)) {
+                        // preview image - it handles the download, if needed
+                        if (searchFragment) {
+                            VirtualFolderType type;
+                            switch (currentSearchType) {
+                                case FAVORITE_SEARCH:
+                                    type = VirtualFolderType.FAVORITE;
+                                    break;
+                                case PHOTO_SEARCH:
+                                    type = VirtualFolderType.PHOTOS;
+                                    break;
+                                default:
+                                    type = VirtualFolderType.NONE;
+                                    break;
+                            }
+                            ((FileDisplayActivity) mContainerActivity).startImagePreview(file, type, !file.isDown());
                         } else {
-                            listDirectory(file, MainApp.isOnlyOnDevice(), false);
-                            // then, notify parent activity to let it update its state and view
-                            mContainerActivity.onBrowsedDownTo(file);
-                            // save index and top position
-                            saveIndexAndTopPosition(position);
+                            ((FileDisplayActivity) mContainerActivity).startImagePreview(file, !file.isDown());
                         }
+                    } else if (file.isDown() && MimeTypeUtil.isVCard(file)) {
+                        ((FileDisplayActivity) mContainerActivity).startContactListFragment(file);
+                    } else if (PreviewTextFragment.canBePreviewed(file)) {
+                        ((FileDisplayActivity) mContainerActivity).startTextPreview(file, false);
+                    } else if (file.isDown()) {
+                        if (PreviewMediaFragment.canBePreviewed(file)) {
+                            // media preview
+                            ((FileDisplayActivity) mContainerActivity).startMediaPreview(file, 0,
+                                    true, false);
+                        } else {
+                            mContainerActivity.getFileOperationsHelper().openFile(file);
+                        }
+
+                    } else {
+                        // automatic download, preview on finish
+                        ((FileDisplayActivity) mContainerActivity).startDownloadForPreview(file);
                     }
-                } else {
-                    // update state and view of this fragment
-                    searchFragment = false;
-                    listDirectory(file, MainApp.isOnlyOnDevice(), false);
-                    // then, notify parent activity to let it update its state and view
-                    mContainerActivity.onBrowsedDownTo(file);
-                    // save index and top position
-                    saveIndexAndTopPosition(position);
+
                 }
 
-            } else { /// Click on a file
-                if (PreviewImageFragment.canBePreviewed(file)) {
-                    // preview image - it handles the download, if needed
-                    if (searchFragment) {
-                        VirtualFolderType type;
-                        switch (currentSearchType) {
-                            case FAVORITE_SEARCH:
-                                type = VirtualFolderType.FAVORITE;
-                                break;
-                            case PHOTO_SEARCH:
-                                type = VirtualFolderType.PHOTOS;
-                                break;
-                            default:
-                                type = VirtualFolderType.NONE;
-                                break;
-                        }
-                        ((FileDisplayActivity) mContainerActivity).startImagePreview(file, type, !file.isDown());
-                    } else {
-                        ((FileDisplayActivity) mContainerActivity).startImagePreview(file, !file.isDown());
-                    }
-                } else if (file.isDown() && MimeTypeUtil.isVCard(file)) {
-                    ((FileDisplayActivity) mContainerActivity).startContactListFragment(file);
-                } else if (PreviewTextFragment.canBePreviewed(file)) {
-                    ((FileDisplayActivity) mContainerActivity).startTextPreview(file, false);
-                } else if (file.isDown()) {
-                    if (PreviewMediaFragment.canBePreviewed(file)) {
-                        // media preview
-                        ((FileDisplayActivity) mContainerActivity).startMediaPreview(file, 0,
-                                true, false);
-                    } else {
-                        mContainerActivity.getFileOperationsHelper().openFile(file);
-                    }
-
-                } else {
-                    // automatic download, preview on finish
-                    ((FileDisplayActivity) mContainerActivity).startDownloadForPreview(file);
-                }
-
+            } else {
+                Log_OC.d(TAG, "Null object in ListAdapter!!");
             }
-
-        } else {
-            Log_OC.d(TAG, "Null object in ListAdapter!!");
         }
-
     }
 
     @Override
@@ -988,7 +1002,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
                 data.getBooleanExtra(SetupEncryptionDialogFragment.SUCCESS, false)) {
 
             int position = data.getIntExtra(SetupEncryptionDialogFragment.ARG_POSITION, -1);
-            OCFile file = (OCFile) mAdapter.getItem(position);
+            OCFile file = mAdapter.getItem(position);
 
             // update state and view of this fragment
             searchFragment = false;
@@ -1005,18 +1019,18 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
     /**
      * Start the appropriate action(s) on the currently selected files given menu selected by the user.
      *
-     * @param menuId Identifier of the action menu selected by the user
+     * @param menuId       Identifier of the action menu selected by the user
      * @param checkedFiles List of files selected by the user on which the action should be performed
      * @return 'true' if the menu selection started any action, 'false' otherwise.
      */
-    public boolean onFileActionChosen(int menuId, ArrayList<OCFile> checkedFiles) {
+    public boolean onFileActionChosen(int menuId, Set<OCFile> checkedFiles) {
         if (checkedFiles.size() <= 0) {
             return false;
         }
 
         if (checkedFiles.size() == 1) {
             /// action only possible on a single file
-            OCFile singleFile = checkedFiles.get(0);
+            OCFile singleFile = checkedFiles.iterator().next();
             switch (menuId) {
                 case R.id.action_send_share_file: {
                     mContainerActivity.getFileOperationsHelper().sendShareFile(singleFile);
@@ -1042,11 +1056,11 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
                     mContainerActivity.getFileOperationsHelper().setPictureAs(singleFile, getView());
                     return true;
                 }
-                case R.id. action_encrypted: {
+                case R.id.action_encrypted: {
                     mContainerActivity.getFileOperationsHelper().toggleEncryption(singleFile, true);
                     return true;
                 }
-                case R.id. action_unset_encrypted: {
+                case R.id.action_unset_encrypted: {
                     mContainerActivity.getFileOperationsHelper().toggleEncryption(singleFile, false);
                     return true;
                 }
@@ -1056,7 +1070,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         /// actions possible on a batch of files
         switch (menuId) {
             case R.id.action_remove_file: {
-                RemoveFilesDialogFragment dialog = RemoveFilesDialogFragment.newInstance(checkedFiles);
+                RemoveFilesDialogFragment dialog = RemoveFilesDialogFragment.newInstance(new ArrayList<>(checkedFiles));
                 dialog.show(getFragmentManager(), ConfirmationDialogFragment.FTAG_CONFIRMATION);
                 return true;
             }
@@ -1087,14 +1101,14 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
             }
             case R.id.action_move: {
                 Intent action = new Intent(getActivity(), FolderPickerActivity.class);
-                action.putParcelableArrayListExtra(FolderPickerActivity.EXTRA_FILES, checkedFiles);
+                action.putParcelableArrayListExtra(FolderPickerActivity.EXTRA_FILES, new ArrayList<>(checkedFiles));
                 action.putExtra(FolderPickerActivity.EXTRA_ACTION, FolderPickerActivity.MOVE);
                 getActivity().startActivityForResult(action, FileDisplayActivity.REQUEST_CODE__MOVE_FILES);
                 return true;
             }
             case R.id.action_copy: {
                 Intent action = new Intent(getActivity(), FolderPickerActivity.class);
-                action.putParcelableArrayListExtra(FolderPickerActivity.EXTRA_FILES, checkedFiles);
+                action.putParcelableArrayListExtra(FolderPickerActivity.EXTRA_FILES, new ArrayList<>(checkedFiles));
                 action.putExtra(FolderPickerActivity.EXTRA_ACTION, FolderPickerActivity.COPY);
                 getActivity().startActivityForResult(action, FileDisplayActivity.REQUEST_CODE__COPY_FILES);
                 return true;
@@ -1190,7 +1204,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
 
                 mAdapter.swapDirectory(directory, storageManager, onlyOnDevice);
                 if (mFile == null || !mFile.equals(directory)) {
-                    mCurrentListView.setSelection(0);
+                    getRecyclerView().scrollToPosition(0);
                 }
                 mFile = directory;
 
@@ -1199,30 +1213,9 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         }
     }
 
-    private void updateFooter() {
-        if (!mJustFolders) {
-            int filesCount = 0;
-            int foldersCount = 0;
-            int count = mAdapter.getCount();
-            OCFile file;
-            for (int i = 0; i < count; i++) {
-                file = (OCFile) mAdapter.getItem(i);
-                if (file.isFolder()) {
-                    foldersCount++;
-                } else {
-                    if (!file.isHidden()) {
-                        filesCount++;
-                    }
-                }
-            }
-            // set footer text
-            setFooterText(generateFooterText(filesCount, foldersCount));
-        }
-    }
 
     private void updateLayout() {
         if (!mJustFolders) {
-            updateFooter();
             // decide grid vs list view
             OwnCloudVersion version = AccountUtils.getServerVersion(
                     ((FileActivity) mContainerActivity).getAccount());
@@ -1242,40 +1235,6 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         }
     }
 
-    private String generateFooterText(int filesCount, int foldersCount) {
-        String output = "";
-
-        if (getActivity() != null) {
-            if (filesCount + foldersCount <= 0) {
-                output = "";
-            } else if (foldersCount <= 0) {
-                output = getResources().getQuantityString(
-                        R.plurals.file_list__footer__file,
-                        filesCount,
-                        filesCount
-                );
-            } else if (filesCount <= 0) {
-                output = getResources().getQuantityString(
-                        R.plurals.file_list__footer__folder,
-                        foldersCount,
-                        foldersCount
-                );
-            } else {
-                output = getResources().getQuantityString(
-                        R.plurals.file_list__footer__file,
-                        filesCount,
-                        filesCount)
-                        + ", "
-                        + getResources().getQuantityString(
-                        R.plurals.file_list__footer__folder,
-                        foldersCount,
-                        foldersCount
-                );
-            }
-        }
-
-        return output;
-    }
 
     public void sortFiles(FileSortOrder sortOrder) {
         mAdapter.setSortOrder(mFile, sortOrder);
@@ -1297,9 +1256,58 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
         switchToListView();
     }
 
+    public void switchToListView() {
+        if (isGridEnabled()) {
+            switchLayoutManager(false);
+        }
+    }
+
     public void setGridAsPreferred() {
         PreferenceManager.setFolderLayout(getActivity(), mFile, FOLDER_LAYOUT_GRID);
         switchToGridView();
+    }
+
+    public void switchToGridView() {
+        if (!isGridEnabled()) {
+            switchLayoutManager(true);
+        }
+    }
+
+    public void switchLayoutManager(boolean grid) {
+        int position = 0;
+
+        if (getRecyclerView().getLayoutManager() != null) {
+            position = ((LinearLayoutManager) getRecyclerView().getLayoutManager())
+                    .findFirstCompletelyVisibleItemPosition();
+        }
+
+        RecyclerView.LayoutManager layoutManager;
+        if (grid) {
+            layoutManager = new GridLayoutManager(getContext(), getColumnSize());
+            ((GridLayoutManager) layoutManager).setSpanSizeLookup(new GridLayoutManager.SpanSizeLookup() {
+                @Override
+                public int getSpanSize(int position) {
+                    if (position == getAdapter().getItemCount() - 1) {
+                        return ((GridLayoutManager) layoutManager).getSpanCount();
+                    } else {
+                        return 1;
+                    }
+                }
+            });
+            
+        } else {
+            layoutManager = new LinearLayoutManager(getContext());
+        }
+
+        getRecyclerView().setLayoutManager(layoutManager);
+        getRecyclerView().scrollToPosition(position);
+        getAdapter().setGridView(grid);
+        getRecyclerView().setAdapter(getAdapter());
+        getAdapter().notifyDataSetChanged();
+    }
+
+    public OCFileListAdapter getAdapter() {
+        return mAdapter;
     }
 
     private void changeGridIcon(Menu menu) {
@@ -1427,6 +1435,7 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
 
         getActivity().getIntent().removeExtra(OCFileListFragment.SEARCH_EVENT);
         getArguments().putParcelable(OCFileListFragment.SEARCH_EVENT, null);
+        getRecyclerView().clearOnScrollListeners();
 
         setFabEnabled(true);
     }
@@ -1474,10 +1483,12 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
     }
 
     @Subscribe(threadMode = ThreadMode.BACKGROUND)
-    public void onMessageEvent(final SearchEvent event) {
+    public void onMessageEvent(final SearchEvent event, boolean clear) {
+
+
         searchFragment = true;
         setEmptyListLoadingMessage();
-        mAdapter.setData(new ArrayList<>(), SearchType.NO_SEARCH, mContainerActivity.getStorageManager(), mFile);
+        mAdapter.setData(new ArrayList<>(), SearchType.NO_SEARCH, mContainerActivity.getStorageManager(), mFile, true);
 
         setFabEnabled(false);
 
@@ -1528,7 +1539,6 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
             new Handler(Looper.getMainLooper()).post(switchViewsRunnable);
         }
 
-        final RemoteOperation remoteOperation;
         if (!currentSearchType.equals(SearchType.SHARED_FILTER)) {
             boolean searchOnlyFolders = false;
             if (getArguments() != null && getArguments().getBoolean(ARG_SEARCH_ONLY_FOLDER, false)) {
@@ -1540,55 +1550,81 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
             remoteOperation = new GetRemoteSharesOperation();
         }
 
-        final Account currentAccount = AccountUtils.getCurrentOwnCloudAccount(MainApp.getAppContext());
+        searchAndDisplay();
 
-        remoteOperationAsyncTask = new AsyncTask() {
-            @Override
-            protected Object doInBackground(Object[] params) {
-                if (getContext() != null && !isCancelled()) {
-                    RemoteOperationResult remoteOperationResult = remoteOperation.execute(currentAccount, getContext());
+        getRecyclerView().setOnScrollListener(onScrollChangeListener);
+    }
 
-                    FileDataStorageManager storageManager = null;
-                    if (mContainerActivity != null && mContainerActivity.getStorageManager() != null) {
-                        storageManager = mContainerActivity.getStorageManager();
-                    }
+    private void searchAndDisplay() {
+        if (!photoSearchQueryRunning && !photoSearchNoNew) {
+            remoteOperationAsyncTask = new AsyncTask() {
+                @Override
+                protected Object doInBackground(Object[] params) {
+                    if (getContext() != null && !isCancelled()) {
+                        photoSearchQueryRunning = true;
+                        final Account currentAccount = AccountUtils.getCurrentOwnCloudAccount(MainApp.getAppContext());
 
-                    if (remoteOperationResult.isSuccess() && remoteOperationResult.getData() != null
-                            && !isCancelled() && searchFragment) {
-                        if (remoteOperationResult.getData() == null || remoteOperationResult.getData().size() == 0) {
-                            setEmptyView(event);
-                        } else {
-                            mAdapter.setData(remoteOperationResult.getData(), currentSearchType, storageManager, mFile);
+                        int limit = -1;
+                        if (currentSearchType.equals(SearchType.PHOTO_SEARCH)) {
+                            limit = 15 * getColumnSize();
                         }
 
-                        final ToolbarActivity fileDisplayActivity = (ToolbarActivity) getActivity();
-                        if (fileDisplayActivity != null) {
-                            fileDisplayActivity.runOnUiThread(new Runnable() {
-                                @Override
-                                public void run() {
-                                    if (fileDisplayActivity != null) {
+                        long timestamp = -1;
+                        if (mAdapter.getLastTimestamp() > 0) {
+                            timestamp = mAdapter.getLastTimestamp();
+                        }
+
+                        if (remoteOperation instanceof SearchOperation) {
+                            SearchOperation searchOperation = (SearchOperation) remoteOperation;
+                            searchOperation.setLimit(limit);
+                            searchOperation.setTimestamp(timestamp);
+                        }
+
+                        RemoteOperationResult remoteOperationResult = remoteOperation.execute(currentAccount, getContext());
+
+                        FileDataStorageManager storageManager = null;
+                        if (mContainerActivity != null && mContainerActivity.getStorageManager() != null) {
+                            storageManager = mContainerActivity.getStorageManager();
+                        }
+
+                        if (remoteOperationResult.isSuccess() && remoteOperationResult.getData() != null
+                                && !isCancelled() && searchFragment) {
+                            if (remoteOperationResult.getData() == null || remoteOperationResult.getData().size() == 0) {
+                                photoSearchNoNew = true;
+                                // todo how distinguish to show 
+                                // setEmptyView(event);
+                            } else {
+                                mAdapter.setData(remoteOperationResult.getData(), currentSearchType, storageManager, mFile, false);
+                            }
+
+                            final ToolbarActivity fileDisplayActivity = (ToolbarActivity) getActivity();
+                            if (fileDisplayActivity != null) {
+                                fileDisplayActivity.runOnUiThread(new Runnable() {
+                                    @Override
+                                    public void run() {
                                         fileDisplayActivity.setIndeterminate(false);
                                     }
-                                }
-                            });
+                                });
+                            }
                         }
+
+                        return remoteOperationResult.isSuccess();
+                    } else {
+                        return false;
                     }
-
-                    return remoteOperationResult.isSuccess();
-                } else {
-                    return false;
                 }
-            }
 
-            @Override
-            protected void onPostExecute(Object o) {
-                if (!isCancelled()) {
-                    mAdapter.notifyDataSetChanged();
+                @Override
+                protected void onPostExecute(Object o) {
+                    photoSearchQueryRunning = false;
+                    if (!isCancelled()) {
+                        mAdapter.notifyDataSetChanged();
+                    }
                 }
-            }
-        };
+            };
 
-        remoteOperationAsyncTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, true);
+            remoteOperationAsyncTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, true);
+        }
     }
 
     @Subscribe(threadMode = ThreadMode.BACKGROUND)
@@ -1609,9 +1645,9 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
             if (remoteOperationResult.isSuccess()) {
                 mAdapter.setEncryptionAttributeForItemID(event.remoteId, event.shouldBeEncrypted);
             } else if (remoteOperationResult.getHttpCode() == HttpStatus.SC_FORBIDDEN) {
-                Snackbar.make(mCurrentListView, R.string.end_to_end_encryption_folder_not_empty, Snackbar.LENGTH_LONG).show();
+                Snackbar.make(getRecyclerView(), R.string.end_to_end_encryption_folder_not_empty, Snackbar.LENGTH_LONG).show();
             } else {
-                Snackbar.make(mCurrentListView, R.string.common_error_unknown, Snackbar.LENGTH_LONG).show();
+                Snackbar.make(getRecyclerView(), R.string.common_error_unknown, Snackbar.LENGTH_LONG).show();
             }
 
         } catch (com.owncloud.android.lib.common.accounts.AccountUtils.AccountNotFoundException e) {
@@ -1672,11 +1708,10 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
     @Override
     public void onRefresh() {
         if (searchEvent != null && searchFragment) {
-            onMessageEvent(searchEvent);
+            mAdapter.resetLastTimestamp();
+            onMessageEvent(searchEvent, true);
 
             mRefreshListLayout.setRefreshing(false);
-            mRefreshGridLayout.setRefreshing(false);
-            mRefreshEmptyLayout.setRefreshing(false);
         } else {
             super.onRefresh();
         }
@@ -1696,9 +1731,18 @@ public class OCFileListFragment extends ExtendedListFragment implements OCFileLi
      * @param select <code>true</code> to select all, <code>false</code> to deselect all
      */
     public void selectAllFiles(boolean select) {
-        AbsListView listView = getListView();
-        for (int position = 0; position < listView.getCount(); position++) {
-            listView.setItemChecked(position, select);
+        OCFileListAdapter ocFileListAdapter = (OCFileListAdapter) getRecyclerView().getAdapter();
+
+        if (select) {
+            ocFileListAdapter.addAllFilesToCheckedFiles();
+        } else {
+            ocFileListAdapter.removeAllFilesFromCheckedFiles();
         }
+
+        for (int i = 0; i < mAdapter.getItemCount(); i++) {
+            mAdapter.notifyItemChanged(i);
+        }
+
+        mActiveActionMode.invalidate();        
     }
 }

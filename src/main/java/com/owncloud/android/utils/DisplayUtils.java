@@ -272,7 +272,7 @@ public class DisplayUtils {
             fallbackString) {
         try {
             return new OwnCloudAccount(savedAccount, context).getDisplayName()
-                    + " @ "
+                    + "@"
                     + convertIdn(accountName.substring(accountName.lastIndexOf('@') + 1), false);
         } catch (Exception e) {
             Log_OC.w(TAG, "Couldn't get display name for account, using old style");
@@ -571,7 +571,7 @@ public class DisplayUtils {
                                 break;
                             case R.id.nav_bar_photos:
                                 SearchEvent photosEvent = new SearchEvent("image/%",
-                                        SearchOperation.SearchType.CONTENT_TYPE_SEARCH,
+                                        SearchOperation.SearchType.PHOTO_SEARCH,
                                         SearchEvent.UnsetType.UNSET_DRAWER);
 
                                 switchToSearchFragment(activity, photosEvent);
